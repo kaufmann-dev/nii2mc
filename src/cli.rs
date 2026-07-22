@@ -1,7 +1,7 @@
 use crate::error::{AppError, Result};
 use crate::manifest::{MINECRAFT_DATA_VERSION, MINECRAFT_VERSION};
 use crate::nifti::read_nifti;
-use crate::world::{self, VerticalAxis};
+use crate::world::{self, MAX_VERTICAL_VOXELS, VerticalAxis};
 use clap::{CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -183,7 +183,8 @@ fn doctor() -> Result<Value> {
             "extensions": [".nii", ".nii.gz"],
             "dimensions": 3,
             "datatypes": ["uint8", "int8", "uint16", "int16", "uint32", "int32"],
-            "maximum_nonzero_labels": 127
+            "maximum_nonzero_labels": 127,
+            "maximum_vertical_voxels": MAX_VERTICAL_VOXELS
         },
         "network_required": false
     }))
@@ -191,10 +192,11 @@ fn doctor() -> Result<Value> {
 
 fn doctor_text() -> String {
     format!(
-        "nii2mc {} is ready\nMinecraft: Java {} (data version {})\nNIfTI: 3D single-file integer label maps (.nii and .nii.gz)\nMaximum nonzero labels: 127\nNetwork: not required",
+        "nii2mc {} is ready\nMinecraft: Java {} (data version {})\nNIfTI: 3D single-file integer label maps (.nii and .nii.gz)\nMaximum nonzero labels: 127\nMaximum vertical voxels: {}\nNetwork: not required",
         env!("CARGO_PKG_VERSION"),
         MINECRAFT_VERSION,
-        MINECRAFT_DATA_VERSION
+        MINECRAFT_DATA_VERSION,
+        MAX_VERTICAL_VOXELS
     )
 }
 

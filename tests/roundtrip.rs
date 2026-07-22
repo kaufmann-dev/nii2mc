@@ -1,11 +1,13 @@
 use assert_cmd::Command;
-use fastanvil::Region;
+use fastanvil::{Chunk, CurrentJavaChunk, Region};
 use fastnbt::Value;
+use flate2::read::GzDecoder;
 use nii2mc::manifest::Manifest;
 use nii2mc::nifti::read_nifti;
 use nii2mc::world::{VerticalAxis, create_world, export_nifti, validate_world};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
+use std::io::Read;
 use std::path::Path;
 
 #[test]
@@ -52,6 +54,7 @@ fn doctor_json_has_a_stable_success_envelope() {
     assert_eq!(value["ok"], true);
     assert_eq!(value["command"], "doctor");
     assert_eq!(value["data"]["minecraft"]["version"], "26.2");
+    assert_eq!(value["data"]["nifti"]["maximum_vertical_voxels"], 4064);
     assert!(output.stderr.is_empty());
 }
 
@@ -72,6 +75,101 @@ fn unknown_blocks_abort_validation_and_export() {
     let output = temporary.path().join("must-not-exist.nii.gz");
     assert!(export_nifti(&world, &output).is_err());
     assert!(!output.exists());
+}
+
+#[test]
+fn tall_volume_uses_a_custom_height_and_round_trips() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("tall-labels.nii");
+    let labels = vec![1; 622];
+    write_test_nifti(&source, [1, 1, 622], &labels);
+
+    let world = temporary.path().join("tall-world");
+    create_world(&source, &world, VerticalAxis::Z).unwrap();
+
+    let manifest = Manifest::load(&world).unwrap();
+    assert_eq!(manifest.dimension_bounds.min_y, -304);
+    assert_eq!(manifest.dimension_bounds.height, 624);
+    assert_eq!(manifest.volume_bounds.min, [0, -303, 0]);
+    assert_eq!(manifest.volume_bounds.max, [0, 318, 0]);
+
+    let dimension_type: serde_json::Value = serde_json::from_slice(
+        &fs::read(world.join("datapacks/nii2mc/data/nii2mc/dimension_type/overworld.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(dimension_type["min_y"], -304);
+    assert_eq!(dimension_type["height"], 624);
+    assert_eq!(dimension_type["logical_height"], 624);
+
+    let level = read_gzip_nbt(&world.join("level.dat"));
+    let Value::Compound(data) = &level["Data"] else {
+        panic!("level.dat Data is not a compound");
+    };
+    let Value::Compound(data_packs) = &data["DataPacks"] else {
+        panic!("level.dat DataPacks is not a compound");
+    };
+    let Value::List(enabled) = &data_packs["Enabled"] else {
+        panic!("level.dat enabled data packs is not a list");
+    };
+    assert!(enabled.contains(&Value::String("file/nii2mc".to_string())));
+
+    let world_gen = read_gzip_nbt(&world.join("data/minecraft/world_gen_settings.dat"));
+    let Value::Compound(world_gen_data) = &world_gen["data"] else {
+        panic!("world generation data is not a compound");
+    };
+    let Value::Compound(dimensions) = &world_gen_data["dimensions"] else {
+        panic!("dimensions is not a compound");
+    };
+    let Value::Compound(overworld) = &dimensions["minecraft:overworld"] else {
+        panic!("Overworld settings are not a compound");
+    };
+    assert_eq!(
+        overworld["type"],
+        Value::String("nii2mc:overworld".to_string())
+    );
+
+    let game_rules = read_gzip_nbt(&world.join("data/minecraft/game_rules.dat"));
+    let Value::Compound(game_rule_data) = &game_rules["data"] else {
+        panic!("game rule data is not a compound");
+    };
+    assert_eq!(game_rule_data["minecraft:advance_time"], Value::Byte(0));
+    assert_eq!(game_rule_data["minecraft:random_tick_speed"], Value::Int(0));
+    assert_eq!(game_rule_data["minecraft:keep_inventory"], Value::Byte(1));
+    assert!(!game_rule_data.contains_key("rules"));
+
+    let chunk = read_chunk(&world, 0, 0);
+    assert_eq!(chunk.y_range(), -304..320);
+    assert_eq!(
+        chunk.block(0, -303, 0).unwrap().name(),
+        "minecraft:bone_block"
+    );
+    assert_eq!(
+        chunk.block(0, 318, 0).unwrap().name(),
+        "minecraft:bone_block"
+    );
+
+    let report = validate_world(&world).unwrap();
+    assert_eq!(report.checked_voxels, 622);
+    let output = temporary.path().join("tall-roundtrip.nii");
+    export_nifti(&world, &output).unwrap();
+    assert_eq!(read_nifti(&output).unwrap().voxels, vec![1; 622]);
+}
+
+#[test]
+fn volume_taller_than_the_custom_dimension_limit_is_rejected() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("too-tall.nii");
+    write_test_nifti(&source, [1, 1, 4065], &vec![1; 4065]);
+
+    let error = create_world(
+        &source,
+        &temporary.path().join("must-not-exist"),
+        VerticalAxis::Z,
+    )
+    .unwrap_err();
+    assert!(error.message.contains("4,064-block"));
+    assert!(error.message.contains("fitting axes: x, y"));
 }
 
 fn write_test_nifti(path: &Path, dimensions: [u16; 3], labels: &[u8]) {
@@ -178,4 +276,29 @@ fn rename_block_in_region(
             &updated,
         )
         .unwrap();
+}
+
+fn read_chunk(world: &Path, chunk_x: i32, chunk_z: i32) -> CurrentJavaChunk {
+    let region_path = world.join(format!(
+        "dimensions/minecraft/overworld/region/r.{}.{}.mca",
+        chunk_x.div_euclid(32),
+        chunk_z.div_euclid(32)
+    ));
+    let file = OpenOptions::new().read(true).open(region_path).unwrap();
+    let mut region = Region::from_stream(file).unwrap();
+    let bytes = region
+        .read_chunk(
+            chunk_x.rem_euclid(32) as usize,
+            chunk_z.rem_euclid(32) as usize,
+        )
+        .unwrap()
+        .unwrap();
+    fastnbt::from_bytes(&bytes).unwrap()
+}
+
+fn read_gzip_nbt(path: &Path) -> HashMap<String, Value> {
+    let mut decoder = GzDecoder::new(fs::File::open(path).unwrap());
+    let mut bytes = Vec::new();
+    decoder.read_to_end(&mut bytes).unwrap();
+    fastnbt::from_bytes(&bytes).unwrap()
 }

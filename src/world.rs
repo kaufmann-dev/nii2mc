@@ -1,8 +1,8 @@
-use crate::anvil::{self, MAX_Y, MIN_Y, compound};
+use crate::anvil::{self, compound};
 use crate::error::{AppError, Result};
 use crate::manifest::{
-    AxisMapping, ChunkBounds, MINECRAFT_DATA_VERSION, MINECRAFT_VERSION, Manifest, NiftiMetadata,
-    PaletteEntry, SCHEMA_VERSION, WorldBounds,
+    AxisMapping, ChunkBounds, DimensionBounds, MINECRAFT_DATA_VERSION, MINECRAFT_VERSION, Manifest,
+    NiftiMetadata, PaletteEntry, SCHEMA_VERSION, WorldBounds,
 };
 use crate::nifti::{NiftiVolume, read_prefix, sha256_bytes, write_nifti};
 use crate::palette::assign_palette;
@@ -21,6 +21,15 @@ use tempfile::TempDir;
 
 type BlockPosition = (i32, i32, i32);
 type GuideBlocks = HashMap<BlockPosition, String>;
+
+const VANILLA_MIN_Y: i32 = -64;
+const VANILLA_MAX_Y: i32 = 319;
+const VANILLA_HEIGHT: u32 = (VANILLA_MAX_Y - VANILLA_MIN_Y + 1) as u32;
+const MIN_DIMENSION_Y: i32 = -2032;
+pub const MAX_VERTICAL_VOXELS: u32 = 4064;
+const SECTION_HEIGHT: u32 = 16;
+const DATA_PACK_ID: &str = "file/nii2mc";
+const DIMENSION_TYPE_ID: &str = "nii2mc:overworld";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum VerticalAxis {
@@ -57,6 +66,7 @@ pub struct WorldInspection {
     pub dimensions: [u32; 3],
     pub spacing: [f32; 3],
     pub vertical_axis: String,
+    pub dimension_bounds: DimensionBounds,
     pub volume_bounds: WorldBounds,
     pub labels: Vec<PaletteEntry>,
 }
@@ -68,6 +78,7 @@ pub struct ConversionReport {
     pub voxel_count: u64,
     pub nonzero_labels: usize,
     pub minecraft_version: String,
+    pub dimension_bounds: DimensionBounds,
     pub volume_bounds: WorldBounds,
 }
 
@@ -84,38 +95,48 @@ pub struct ValidationReport {
 struct Placement {
     vertical: usize,
     horizontal: [usize; 2],
+    dimension_bounds: DimensionBounds,
     bounds: WorldBounds,
 }
 
 impl Placement {
     fn new(dimensions: [u32; 3], vertical_axis: VerticalAxis) -> Result<Self> {
         let vertical = vertical_axis.index();
-        let vertical_length = dimensions[vertical] as i32;
-        if vertical_length > MAX_Y - MIN_Y + 1 {
+        let vertical_length = dimensions[vertical];
+        if vertical_length > MAX_VERTICAL_VOXELS {
             let fitting: Vec<&str> = [VerticalAxis::X, VerticalAxis::Y, VerticalAxis::Z]
                 .into_iter()
-                .filter(|axis| dimensions[axis.index()] as i32 <= MAX_Y - MIN_Y + 1)
+                .filter(|axis| dimensions[axis.index()] <= MAX_VERTICAL_VOXELS)
                 .map(VerticalAxis::name)
                 .collect();
             return Err(AppError::incompatible(format!(
-                "NIfTI {} axis has {} voxels, exceeding Minecraft's 384-block build height; fitting axes: {}",
+                "NIfTI {} axis has {} voxels, exceeding Minecraft's 4,064-block custom-dimension height limit; fitting axes: {}",
                 vertical_axis.name(),
                 vertical_length,
                 if fitting.is_empty() { "none".to_string() } else { fitting.join(", ") }
             ))
             .with_details(json!({"vertical_length": vertical_length, "fitting_axes": fitting})));
         }
+        let dimension_height = vertical_length
+            .max(VANILLA_HEIGHT)
+            .next_multiple_of(SECTION_HEIGHT);
+        let dimension_min_y = (VANILLA_MAX_Y + 1 - dimension_height as i32).max(MIN_DIMENSION_Y);
+        let dimension_bounds = DimensionBounds {
+            min_y: dimension_min_y,
+            height: dimension_height,
+        };
         let horizontal: Vec<usize> = (0..3).filter(|axis| *axis != vertical).collect();
         let horizontal = [horizontal[0], horizontal[1]];
         let len_x = dimensions[horizontal[0]] as i32;
         let len_z = dimensions[horizontal[1]] as i32;
-        let len_y = dimensions[vertical] as i32;
+        let len_y = vertical_length as i32;
         let min_x = -(len_x / 2);
         let min_z = -(len_z / 2);
-        let min_y = MIN_Y + ((MAX_Y - MIN_Y + 1 - len_y) / 2);
+        let min_y = dimension_bounds.min_y + ((dimension_bounds.height as i32 - len_y) / 2);
         Ok(Self {
             vertical,
             horizontal,
+            dimension_bounds,
             bounds: WorldBounds {
                 min: [min_x, min_y, min_z],
                 max: [min_x + len_x - 1, min_y + len_y - 1, min_z + len_z - 1],
@@ -171,7 +192,7 @@ pub fn create_world(
     let volume = crate::nifti::read_nifti(input)?;
     let placement = Placement::new(volume.metadata.dimensions, vertical_axis)?;
     let mut palette = assign_palette(&volume.counts, &volume.label_names)?;
-    let (guides, spawn) = build_guides(&placement.bounds, &mut palette);
+    let (guides, spawn) = build_guides(&placement.bounds, placement.dimension_bounds, &mut palette);
     let chunk_bounds = chunk_bounds(&placement.bounds);
     let manifest = make_manifest(
         input,
@@ -190,7 +211,14 @@ pub fn create_world(
             .ok_or_else(|| AppError::usage("output must name a world directory"))?,
     );
     fs::create_dir(&staging)?;
-    write_world_metadata(&staging, output, &placement.bounds, &guides, spawn)?;
+    write_world_metadata(
+        &staging,
+        output,
+        &placement.bounds,
+        placement.dimension_bounds,
+        &guides,
+        spawn,
+    )?;
     manifest.write(&staging)?;
     fs::write(Manifest::prefix_path(&staging), &volume.prefix)?;
 
@@ -207,7 +235,7 @@ pub fn create_world(
         chunks.len(),
         MINECRAFT_VERSION
     );
-    anvil::write_chunks(&staging, &chunks, |x, y, z| {
+    anvil::write_chunks(&staging, &chunks, placement.dimension_bounds, |x, y, z| {
         if let Some(block) = guides.get(&(x, y, z)) {
             return Some(block.clone());
         }
@@ -223,6 +251,7 @@ pub fn create_world(
         voxel_count: volume.voxels.len() as u64,
         nonzero_labels: palette.len(),
         minecraft_version: MINECRAFT_VERSION.to_string(),
+        dimension_bounds: placement.dimension_bounds,
         volume_bounds: placement.bounds,
     })
 }
@@ -247,13 +276,18 @@ fn make_manifest(
         prefix_sha256: sha256_bytes(&volume.prefix),
         nifti: volume.metadata.clone(),
         axes: placement.axis_mapping(),
+        dimension_bounds: placement.dimension_bounds,
         volume_bounds: placement.bounds.clone(),
         required_chunks,
         palette,
     }
 }
 
-fn build_guides(bounds: &WorldBounds, palette: &mut [PaletteEntry]) -> (GuideBlocks, [i32; 3]) {
+fn build_guides(
+    bounds: &WorldBounds,
+    dimension_bounds: DimensionBounds,
+    palette: &mut [PaletteEntry],
+) -> (GuideBlocks, [i32; 3]) {
     let mut guides = HashMap::new();
     let frame_min_x = bounds.min[0] - 2;
     let frame_max_x = bounds.max[0] + 2;
@@ -285,7 +319,8 @@ fn build_guides(bounds: &WorldBounds, palette: &mut [PaletteEntry]) -> (GuideBlo
 
     let origin_x = bounds.max[0] + 10;
     let origin_z = bounds.min[2];
-    let platform_y = (bounds.min[1] + 5).clamp(MIN_Y + 1, MAX_Y - 3);
+    let platform_y =
+        (bounds.min[1] + 5).clamp(dimension_bounds.min_y + 1, dimension_bounds.max_y() - 3);
     let rows = palette.len().max(1).div_ceil(16) as i32;
     for x in origin_x - 3..=origin_x + 18 {
         for z in origin_z - 5..=origin_z + rows + 2 {
@@ -328,6 +363,7 @@ fn write_world_metadata(
     world: &Path,
     output: &Path,
     volume_bounds: &WorldBounds,
+    dimension_bounds: DimensionBounds,
     guides: &GuideBlocks,
     spawn: [i32; 3],
 ) -> Result<()> {
@@ -368,7 +404,10 @@ fn write_world_metadata(
                 compound([
                     (
                         "Enabled",
-                        Value::List(vec![Value::String("vanilla".to_string())]),
+                        Value::List(vec![
+                            Value::String("vanilla".to_string()),
+                            Value::String(DATA_PACK_ID.to_string()),
+                        ]),
                     ),
                     ("Disabled", Value::List(Vec::new())),
                 ]),
@@ -389,6 +428,7 @@ fn write_world_metadata(
         ]),
     )]);
     anvil::write_gzip_nbt(&world.join("level.dat"), &level_data)?;
+    write_dimension_data_pack(world, dimension_bounds)?;
 
     let data_root = |data| {
         HashMap::from([
@@ -399,23 +439,20 @@ fn write_world_metadata(
             ("data".to_string(), data),
         ])
     };
-    let game_rules = compound([(
-        "rules",
-        compound([
-            ("doDaylightCycle", Value::String("false".to_string())),
-            ("doWeatherCycle", Value::String("false".to_string())),
-            ("doMobSpawning", Value::String("false".to_string())),
-            ("doPatrolSpawning", Value::String("false".to_string())),
-            ("doTraderSpawning", Value::String("false".to_string())),
-            ("doWardenSpawning", Value::String("false".to_string())),
-            ("doInsomnia", Value::String("false".to_string())),
-            ("doFireTick", Value::String("false".to_string())),
-            ("mobGriefing", Value::String("false".to_string())),
-            ("randomTickSpeed", Value::String("0".to_string())),
-            ("doVinesSpread", Value::String("false".to_string())),
-            ("keepInventory", Value::String("true".to_string())),
-        ]),
-    )]);
+    let game_rules = compound([
+        ("minecraft:advance_time", Value::Byte(0)),
+        ("minecraft:advance_weather", Value::Byte(0)),
+        ("minecraft:spawn_mobs", Value::Byte(0)),
+        ("minecraft:spawn_patrols", Value::Byte(0)),
+        ("minecraft:spawn_wandering_traders", Value::Byte(0)),
+        ("minecraft:spawn_wardens", Value::Byte(0)),
+        ("minecraft:spawn_phantoms", Value::Byte(0)),
+        ("minecraft:fire_spread_radius_around_player", Value::Int(0)),
+        ("minecraft:mob_griefing", Value::Byte(0)),
+        ("minecraft:random_tick_speed", Value::Int(0)),
+        ("minecraft:spread_vines", Value::Byte(0)),
+        ("minecraft:keep_inventory", Value::Byte(1)),
+    ]);
     anvil::write_gzip_nbt(
         &world.join("data/minecraft/game_rules.dat"),
         &data_root(game_rules),
@@ -451,7 +488,7 @@ fn write_world_metadata(
             Value::Compound(HashMap::from([
                 (
                     "minecraft:overworld".to_string(),
-                    dimension_generator("minecraft:overworld", "minecraft:the_void"),
+                    dimension_generator(DIMENSION_TYPE_ID, "minecraft:the_void"),
                 ),
                 (
                     "minecraft:the_nether".to_string(),
@@ -501,6 +538,81 @@ fn write_world_metadata(
     Ok(())
 }
 
+fn write_dimension_data_pack(world: &Path, bounds: DimensionBounds) -> Result<()> {
+    let pack = json!({
+        "pack": {
+            "description": "nii2mc custom-height Overworld",
+            "min_format": [107, 1],
+            "max_format": 107
+        }
+    });
+    let dimension_type = json!({
+        "ambient_light": 0.0,
+        "attributes": {
+            "minecraft:audio/ambient_sounds": {
+                "mood": {
+                    "block_search_extent": 8,
+                    "offset": 2.0,
+                    "sound": "minecraft:ambient.cave",
+                    "tick_delay": 6000
+                }
+            },
+            "minecraft:audio/background_music": {
+                "creative": {
+                    "max_delay": 24000,
+                    "min_delay": 12000,
+                    "sound": "minecraft:music.creative"
+                },
+                "default": {
+                    "max_delay": 24000,
+                    "min_delay": 12000,
+                    "sound": "minecraft:music.game"
+                }
+            },
+            "minecraft:gameplay/bed_rule": {
+                "can_set_spawn": "always",
+                "can_sleep": "when_dark",
+                "error_message": {
+                    "translate": "block.minecraft.bed.no_sleep"
+                }
+            },
+            "minecraft:gameplay/nether_portal_spawns_piglin": true,
+            "minecraft:gameplay/respawn_anchor_works": false,
+            "minecraft:visual/ambient_light_color": "#0a0a0a",
+            "minecraft:visual/cloud_color": "#ccffffff",
+            "minecraft:visual/cloud_height": 192.33,
+            "minecraft:visual/fog_color": "#c0d8ff",
+            "minecraft:visual/sky_color": "#78a7ff"
+        },
+        "coordinate_scale": 1.0,
+        "default_clock": "minecraft:overworld",
+        "has_ceiling": false,
+        "has_ender_dragon_fight": false,
+        "has_skylight": true,
+        "height": bounds.height,
+        "infiniburn": "#minecraft:infiniburn_overworld",
+        "logical_height": bounds.height,
+        "min_y": bounds.min_y,
+        "monster_spawn_block_light_limit": 0,
+        "monster_spawn_light_level": {
+            "type": "minecraft:uniform",
+            "max_inclusive": 7,
+            "min_inclusive": 0
+        },
+        "timelines": "#minecraft:in_overworld"
+    });
+    let pack_root = world.join("datapacks/nii2mc");
+    let dimension_directory = pack_root.join("data/nii2mc/dimension_type");
+    fs::create_dir_all(&dimension_directory)?;
+    let pack_bytes = serde_json::to_vec_pretty(&pack)
+        .map_err(|error| AppError::io(format!("cannot encode dimension data pack: {error}")))?;
+    fs::write(pack_root.join("pack.mcmeta"), pack_bytes)?;
+    let dimension_bytes = serde_json::to_vec_pretty(&dimension_type)
+        .map_err(|error| AppError::io(format!("cannot encode dimension type: {error}")))?;
+    fs::write(dimension_directory.join("overworld.json"), dimension_bytes)?;
+    Ok(())
+}
+
 fn dimension_generator(dimension_type: &str, biome: &str) -> Value {
     compound([
         ("type", Value::String(dimension_type.to_string())),
@@ -540,6 +652,7 @@ pub fn inspect_world(world: &Path) -> Result<WorldInspection> {
         dimensions: manifest.nifti.dimensions,
         spacing: manifest.nifti.spacing,
         vertical_axis: manifest.axes.vertical_axis,
+        dimension_bounds: manifest.dimension_bounds,
         volume_bounds: manifest.volume_bounds,
         labels: manifest.palette,
     })
@@ -629,6 +742,7 @@ pub fn export_nifti(world: &Path, output: &Path) -> Result<ConversionReport> {
         voxel_count: voxels.len() as u64,
         nonzero_labels: manifest.palette.len(),
         minecraft_version: manifest.minecraft_version,
+        dimension_bounds: manifest.dimension_bounds,
         volume_bounds: manifest.volume_bounds,
     })
 }
@@ -731,13 +845,17 @@ fn placement_from_manifest(manifest: &Manifest) -> Result<Placement> {
     let placement = Placement {
         vertical,
         horizontal: [horizontal[0], horizontal[1]],
+        dimension_bounds: manifest.dimension_bounds,
         bounds: manifest.volume_bounds.clone(),
     };
     let expected = Placement::new(
         manifest.nifti.dimensions,
         [VerticalAxis::X, VerticalAxis::Y, VerticalAxis::Z][vertical],
     )?;
-    if placement.bounds != expected.bounds || placement.horizontal != expected.horizontal {
+    if placement.bounds != expected.bounds
+        || placement.horizontal != expected.horizontal
+        || placement.dimension_bounds != expected.dimension_bounds
+    {
         return Err(AppError::incompatible(
             "manifest axis mapping and volume bounds are inconsistent",
         ));

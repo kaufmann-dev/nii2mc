@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const MINECRAFT_VERSION: &str = "26.2";
 pub const MINECRAFT_DATA_VERSION: i32 = 4903;
 pub const MANIFEST_DIR: &str = ".nii2mc";
@@ -34,6 +34,18 @@ pub struct NiftiMetadata {
 pub struct WorldBounds {
     pub min: [i32; 3],
     pub max: [i32; 3],
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DimensionBounds {
+    pub min_y: i32,
+    pub height: u32,
+}
+
+impl DimensionBounds {
+    pub fn max_y(self) -> i32 {
+        self.min_y + self.height as i32 - 1
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +84,7 @@ pub struct Manifest {
     pub prefix_sha256: String,
     pub nifti: NiftiMetadata,
     pub axes: AxisMapping,
+    pub dimension_bounds: DimensionBounds,
     pub volume_bounds: WorldBounds,
     pub required_chunks: ChunkBounds,
     pub palette: Vec<PaletteEntry>,

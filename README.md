@@ -2,7 +2,7 @@
 
 `nii2mc` turns a discrete 3D NIfTI label map into an editable Minecraft Java world and converts the edited blocks back to `.nii` or `.nii.gz`. One NIfTI voxel becomes one Minecraft block. It does not resample the image, so anisotropic medical voxels can look stretched in Minecraft by design.
 
-The generated world targets Minecraft Java Edition 26.2 (world data version 4903). It is a creative, peaceful void world with a lit wireframe around the editable medical volume, a spawn platform, and a block legend outside the export bounds.
+The generated world targets Minecraft Java Edition 26.2 (world data version 4903). It is a creative, peaceful void world with a lit wireframe around the editable medical volume, a spawn platform, and a block legend outside the export bounds. A bundled data pack gives the Overworld enough vertical height for the selected NIfTI axis.
 
 ## Install
 
@@ -84,9 +84,9 @@ The 127 available label blocks are deterministic, inert, and visually varied. Th
 
 ## Coordinate behavior
 
-The selected NIfTI axis maps to Minecraft Y. The other two NIfTI axes, in their original order, map to Minecraft X and Z. No axis is flipped, reoriented, or resampled. X and Z are centered around zero; Y is centered within Minecraft's `-64..319` build range.
+The selected NIfTI axis maps to Minecraft Y. The other two NIfTI axes, in their original order, map to Minecraft X and Z. No axis is flipped, reoriented, or resampled. X and Z are centered around zero, and Y is centered within the generated dimension.
 
-A selected vertical axis may contain at most 384 voxels. If it is too long, the error lists the axes that fit.
+The dimension keeps Minecraft's standard `-64..319` range for axes up to 384 voxels. For a longer axis, `nii2mc` expands the dimension to the smallest fitting multiple of 16 blocks, up to Minecraft Java's 4,064-block custom-dimension limit. The generated `datapacks/nii2mc` directory is required world data and must remain in place. If the selected axis exceeds 4,064 voxels, the error lists the axes that fit.
 
 ## Safety and validation
 
@@ -124,6 +124,7 @@ The first format version intentionally supports only:
 - `uint8`, `int8`, `uint16`, `int16`, `uint32`, or `int32` storage
 - Nonnegative discrete labels with identity scaling
 - Label `0` as background and at most 127 distinct nonzero labels
+- At most 4,064 voxels along the selected vertical axis
 - Minecraft Java Edition 26.2 worlds created by this tool
 
 NIfTI-2, Analyze pairs, floating-point/probability maps, 4D images, scaled integer payloads, Bedrock Edition, older/newer Minecraft world versions, and arbitrary existing worlds are rejected explicitly.

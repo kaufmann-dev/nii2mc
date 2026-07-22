@@ -1,16 +1,11 @@
 use crate::error::{AppError, Result};
-use crate::manifest::MINECRAFT_DATA_VERSION;
+use crate::manifest::{DimensionBounds, MINECRAFT_DATA_VERSION};
 use fastanvil::Region;
 use fastnbt::{LongArray, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-pub const MIN_Y: i32 = -64;
-pub const MAX_Y: i32 = 319;
-const MIN_SECTION_Y: i32 = -4;
-const MAX_SECTION_Y: i32 = 19;
 
 pub fn region_directory(world: &Path) -> PathBuf {
     world.join("dimensions/minecraft/overworld/region")
@@ -20,7 +15,12 @@ pub fn region_path(world: &Path, region_x: i32, region_z: i32) -> PathBuf {
     region_directory(world).join(format!("r.{region_x}.{region_z}.mca"))
 }
 
-pub fn write_chunks<F>(world: &Path, chunks: &BTreeSet<(i32, i32)>, mut block_at: F) -> Result<()>
+pub fn write_chunks<F>(
+    world: &Path,
+    chunks: &BTreeSet<(i32, i32)>,
+    dimension_bounds: DimensionBounds,
+    mut block_at: F,
+) -> Result<()>
 where
     F: FnMut(i32, i32, i32) -> Option<String>,
 {
@@ -52,7 +52,7 @@ where
             ))
         })?;
         for (chunk_x, chunk_z) in region_chunks {
-            let chunk = make_chunk(chunk_x, chunk_z, &mut block_at)?;
+            let chunk = make_chunk(chunk_x, chunk_z, dimension_bounds, &mut block_at)?;
             let local_x = chunk_x.rem_euclid(32) as usize;
             let local_z = chunk_z.rem_euclid(32) as usize;
             region
@@ -68,13 +68,20 @@ where
     Ok(())
 }
 
-fn make_chunk<F>(chunk_x: i32, chunk_z: i32, block_at: &mut F) -> Result<Vec<u8>>
+fn make_chunk<F>(
+    chunk_x: i32,
+    chunk_z: i32,
+    dimension_bounds: DimensionBounds,
+    block_at: &mut F,
+) -> Result<Vec<u8>>
 where
     F: FnMut(i32, i32, i32) -> Option<String>,
 {
-    let mut sections = Vec::with_capacity((MAX_SECTION_Y - MIN_SECTION_Y + 1) as usize);
+    let min_section_y = dimension_bounds.min_y.div_euclid(16);
+    let max_section_y = dimension_bounds.max_y().div_euclid(16);
+    let mut sections = Vec::with_capacity((max_section_y - min_section_y + 1) as usize);
     let mut height = [0u16; 256];
-    for section_y in MIN_SECTION_Y..=MAX_SECTION_Y {
+    for section_y in min_section_y..=max_section_y {
         let mut palette = vec!["minecraft:air".to_string()];
         let mut palette_index = HashMap::from([("minecraft:air".to_string(), 0u16)]);
         let mut states = vec![0u16; 4096];
@@ -95,7 +102,7 @@ where
                     let state_index = (local_y * 256 + local_z * 16 + local_x) as usize;
                     states[state_index] = index;
                     let column = (local_z * 16 + local_x) as usize;
-                    let encoded_height = (world_y + 1 - MIN_Y) as u16;
+                    let encoded_height = (world_y + 1 - dimension_bounds.min_y) as u16;
                     height[column] = height[column].max(encoded_height);
                 }
             }
@@ -103,7 +110,8 @@ where
         sections.push(section_value(section_y, palette, &states));
     }
 
-    let packed_height = pack_values(&height, 9);
+    let heightmap_bits = min_bits(dimension_bounds.height as usize + 1);
+    let packed_height = pack_values(&height, heightmap_bits);
     let heightmaps = compound([
         (
             "MOTION_BLOCKING",
@@ -123,7 +131,7 @@ where
         ),
     ]);
 
-    let post_processing = (MIN_SECTION_Y..=MAX_SECTION_Y)
+    let post_processing = (min_section_y..=max_section_y)
         .map(|_| Value::List(Vec::new()))
         .collect();
     let root = HashMap::from([
@@ -132,7 +140,7 @@ where
             Value::Int(MINECRAFT_DATA_VERSION),
         ),
         ("xPos".to_string(), Value::Int(chunk_x)),
-        ("yPos".to_string(), Value::Int(MIN_SECTION_Y)),
+        ("yPos".to_string(), Value::Int(min_section_y)),
         ("zPos".to_string(), Value::Int(chunk_z)),
         (
             "Status".to_string(),
@@ -255,9 +263,17 @@ mod tests {
 
     #[test]
     fn packed_values_round_trip_through_fastanvil() {
-        let chunk = make_chunk(0, 0, &mut |x, y, z| {
-            (x == 3 && y == -10 && z == 4).then(|| "minecraft:red_concrete".to_string())
-        })
+        let chunk = make_chunk(
+            0,
+            0,
+            DimensionBounds {
+                min_y: -64,
+                height: 384,
+            },
+            &mut |x, y, z| {
+                (x == 3 && y == -10 && z == 4).then(|| "minecraft:red_concrete".to_string())
+            },
+        )
         .unwrap();
         let chunk: CurrentJavaChunk = fastnbt::from_bytes(&chunk).unwrap();
         assert_eq!(
