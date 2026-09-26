@@ -4,4 +4,5 @@ pub mod error;
 pub mod manifest;
 pub mod nifti;
 pub mod palette;
+pub mod resample;
 pub mod world;
