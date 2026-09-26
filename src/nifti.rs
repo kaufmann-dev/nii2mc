@@ -190,37 +190,7 @@ fn parse_uncompressed(
         *counts.entry(*label).or_insert(0) += 1;
     }
     let label_names = parse_label_names(&prefix, endian);
-    let units = prefix[123];
-    let metadata = NiftiMetadata {
-        dimensions,
-        spacing: [
-            f32_at(&prefix, 80, endian).abs(),
-            f32_at(&prefix, 84, endian).abs(),
-            f32_at(&prefix, 88, endian).abs(),
-        ],
-        datatype,
-        bits_per_voxel: expected_bits,
-        endianness: endian.name().to_string(),
-        voxel_offset: voxel_offset as u64,
-        qform_code: i16_at(&prefix, 252, endian),
-        sform_code: i16_at(&prefix, 254, endian),
-        quaternion: [
-            f32_at(&prefix, 256, endian),
-            f32_at(&prefix, 260, endian),
-            f32_at(&prefix, 264, endian),
-        ],
-        qoffset: [
-            f32_at(&prefix, 268, endian),
-            f32_at(&prefix, 272, endian),
-            f32_at(&prefix, 276, endian),
-        ],
-        srow_x: four_f32(&prefix, 280, endian),
-        srow_y: four_f32(&prefix, 296, endian),
-        srow_z: four_f32(&prefix, 312, endian),
-        spatial_units: units & 0x07,
-        temporal_units: units & 0x38,
-        description: nul_terminated_text(&prefix[148..228]),
-    };
+    let metadata = metadata_from_prefix(&prefix, endian, dimensions, datatype, expected_bits);
 
     Ok(NiftiVolume {
         metadata,
@@ -231,6 +201,47 @@ fn parse_uncompressed(
         source_sha256,
         endian,
     })
+}
+
+/// Header facts recorded in the manifest, read from a validated prefix.
+pub(crate) fn metadata_from_prefix(
+    prefix: &[u8],
+    endian: Endian,
+    dimensions: [u32; 3],
+    datatype: u16,
+    bits_per_voxel: u16,
+) -> NiftiMetadata {
+    let units = prefix[123];
+    NiftiMetadata {
+        dimensions,
+        spacing: [
+            f32_at(prefix, 80, endian).abs(),
+            f32_at(prefix, 84, endian).abs(),
+            f32_at(prefix, 88, endian).abs(),
+        ],
+        datatype,
+        bits_per_voxel,
+        endianness: endian.name().to_string(),
+        voxel_offset: prefix.len() as u64,
+        qform_code: i16_at(prefix, 252, endian),
+        sform_code: i16_at(prefix, 254, endian),
+        quaternion: [
+            f32_at(prefix, 256, endian),
+            f32_at(prefix, 260, endian),
+            f32_at(prefix, 264, endian),
+        ],
+        qoffset: [
+            f32_at(prefix, 268, endian),
+            f32_at(prefix, 272, endian),
+            f32_at(prefix, 276, endian),
+        ],
+        srow_x: four_f32(prefix, 280, endian),
+        srow_y: four_f32(prefix, 296, endian),
+        srow_z: four_f32(prefix, 312, endian),
+        spatial_units: units & 0x07,
+        temporal_units: units & 0x38,
+        description: nul_terminated_text(&prefix[148..228]),
+    }
 }
 
 fn read_voxels(
@@ -422,13 +433,15 @@ fn parse_label_names(prefix: &[u8], endian: Endian) -> BTreeMap<u32, String> {
 fn parse_xml_labels(payload: &[u8]) -> BTreeMap<u32, String> {
     let payload = payload.strip_suffix(&[0]).unwrap_or(payload);
     let mut reader = XmlReader::from_reader(payload);
-    reader.config_mut().trim_text(true);
     let mut names = BTreeMap::new();
     let mut current_label = None;
+    let mut text = String::new();
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) => {
                 if element.name().as_ref().eq_ignore_ascii_case(b"label") {
+                    current_label = None;
+                    text.clear();
                     for attribute in element.attributes().flatten() {
                         if [b"key".as_slice(), b"index".as_slice(), b"value".as_slice()]
                             .iter()
@@ -436,24 +449,48 @@ fn parse_xml_labels(payload: &[u8]) -> BTreeMap<u32, String> {
                         {
                             current_label = std::str::from_utf8(attribute.value.as_ref())
                                 .ok()
-                                .and_then(|value| value.parse().ok());
+                                .and_then(|value| value.trim().parse().ok());
                         }
                     }
                 }
             }
-            Ok(Event::Text(text)) => {
-                if let Some(label) = current_label
-                    && let Ok(value) = text.decode()
+            // TotalSegmentator writes names as CDATA; other tools use plain text,
+            // and entity references split plain text into several events.
+            Ok(Event::Text(value)) => {
+                if current_label.is_some()
+                    && let Ok(value) = value.decode()
                 {
-                    let value = value.trim();
-                    if !value.is_empty() {
-                        names.insert(label, value.to_string());
+                    text.push_str(&value);
+                }
+            }
+            Ok(Event::CData(value)) => {
+                if current_label.is_some()
+                    && let Ok(value) = value.decode()
+                {
+                    text.push_str(&value);
+                }
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                if current_label.is_some() {
+                    if let Ok(Some(character)) = reference.resolve_char_ref() {
+                        text.push(character);
+                    } else if let Ok(name) = reference.decode()
+                        && let Some(value) = quick_xml::escape::resolve_predefined_entity(&name)
+                    {
+                        text.push_str(value);
                     }
                 }
             }
             Ok(Event::End(element)) => {
                 if element.name().as_ref().eq_ignore_ascii_case(b"label") {
+                    if let Some(label) = current_label {
+                        let value = text.trim();
+                        if !value.is_empty() {
+                            names.insert(label, value.to_string());
+                        }
+                    }
                     current_label = None;
+                    text.clear();
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -544,11 +581,11 @@ pub fn datatype_name(datatype: u16) -> &'static str {
     }
 }
 
-fn i16_at(bytes: &[u8], offset: usize, endian: Endian) -> i16 {
+pub(crate) fn i16_at(bytes: &[u8], offset: usize, endian: Endian) -> i16 {
     read_i16(&bytes[offset..offset + 2], endian)
 }
 
-fn f32_at(bytes: &[u8], offset: usize, endian: Endian) -> f32 {
+pub(crate) fn f32_at(bytes: &[u8], offset: usize, endian: Endian) -> f32 {
     let raw = read_u32(&bytes[offset..offset + 4], endian);
     f32::from_bits(raw)
 }

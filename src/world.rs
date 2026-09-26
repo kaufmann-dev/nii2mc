@@ -5,7 +5,8 @@ use crate::manifest::{
     NiftiMetadata, PaletteEntry, SCHEMA_VERSION, WorldBounds,
 };
 use crate::nifti::{NiftiVolume, read_prefix, sha256_bytes, write_nifti};
-use crate::palette::assign_palette;
+use crate::palette::{PaletteOverride, assign_palette_with};
+use crate::resample::{Orientation, TransformOptions, TransformRecord};
 use clap::ValueEnum;
 use fastanvil::{Chunk, CurrentJavaChunk};
 use fastnbt::Value;
@@ -39,7 +40,7 @@ pub enum VerticalAxis {
 }
 
 impl VerticalAxis {
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             Self::X => 0,
             Self::Y => 1,
@@ -80,6 +81,21 @@ pub struct ConversionReport {
     pub minecraft_version: String,
     pub dimension_bounds: DimensionBounds,
     pub volume_bounds: WorldBounds,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<TransformRecord>,
+}
+
+/// Optional `to-world` behaviour; the default reproduces the original output.
+#[derive(Debug, Clone, Default)]
+pub struct WorldOptions {
+    /// NIfTI axis mapped to Minecraft Y; `None` means z (forced by anatomical).
+    pub vertical_axis: Option<VerticalAxis>,
+    pub transform: TransformOptions,
+    /// `LevelName` shown in Minecraft's world list (default: folder name).
+    pub world_name: Option<String>,
+    /// File name recorded in the manifest instead of the real input name.
+    pub source_name: Option<String>,
+    pub palette: BTreeMap<u32, PaletteOverride>,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,25 +198,58 @@ pub fn create_world(
     output: &Path,
     vertical_axis: VerticalAxis,
 ) -> Result<ConversionReport> {
+    create_world_with(
+        input,
+        output,
+        &WorldOptions {
+            vertical_axis: Some(vertical_axis),
+            ..WorldOptions::default()
+        },
+    )
+}
+
+pub fn create_world_with(
+    input: &Path,
+    output: &Path,
+    options: &WorldOptions,
+) -> Result<ConversionReport> {
     if output.exists() {
         return Err(AppError::usage(format!(
             "output {} already exists; refusing to overwrite it",
             output.display()
         )));
     }
+    let anatomical = options.transform.orientation == Orientation::Anatomical;
+    if anatomical && matches!(options.vertical_axis, Some(axis) if axis.index() != 2) {
+        return Err(AppError::usage(
+            "--orient anatomical always places superior on Minecraft Y; omit --vertical-axis",
+        ));
+    }
+    let vertical_axis = options.vertical_axis.unwrap_or(VerticalAxis::Z);
     eprintln!("Reading and validating {}...", input.display());
-    let volume = crate::nifti::read_nifti(input)?;
+    let mut volume = crate::nifti::read_nifti(input)?;
+    let mut transform = None;
+    if !options.transform.is_identity() {
+        eprintln!("Resampling and orienting the label grid...");
+        let (derived, record) = crate::resample::transform(volume, &options.transform)?;
+        volume = derived;
+        transform = Some(record);
+    }
     let placement = Placement::new(volume.metadata.dimensions, vertical_axis)?;
-    let mut palette = assign_palette(&volume.counts, &volume.label_names)?;
+    let mut palette = assign_palette_with(&volume.counts, &volume.label_names, &options.palette)?;
     let (guides, spawn) = build_guides(&placement.bounds, placement.dimension_bounds, &mut palette);
     let chunk_bounds = chunk_bounds(&placement.bounds);
-    let manifest = make_manifest(
+    let mut manifest = make_manifest(
         input,
         &volume,
         &placement,
         chunk_bounds.clone(),
         palette.clone(),
     );
+    if let Some(name) = &options.source_name {
+        manifest.source_filename = name.clone();
+    }
+    manifest.transform = transform.clone();
 
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
@@ -211,9 +260,15 @@ pub fn create_world(
             .ok_or_else(|| AppError::usage("output must name a world directory"))?,
     );
     fs::create_dir(&staging)?;
+    let world_name = options.world_name.clone().unwrap_or_else(|| {
+        output
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "nii2mc world".to_string())
+    });
     write_world_metadata(
         &staging,
-        output,
+        &world_name,
         &placement.bounds,
         placement.dimension_bounds,
         &guides,
@@ -253,6 +308,7 @@ pub fn create_world(
         minecraft_version: MINECRAFT_VERSION.to_string(),
         dimension_bounds: placement.dimension_bounds,
         volume_bounds: placement.bounds,
+        transform,
     })
 }
 
@@ -280,6 +336,7 @@ fn make_manifest(
         volume_bounds: placement.bounds.clone(),
         required_chunks,
         palette,
+        transform: None,
     }
 }
 
@@ -361,16 +418,13 @@ fn required_chunk_set(bounds: ChunkBounds) -> BTreeSet<(i32, i32)> {
 
 fn write_world_metadata(
     world: &Path,
-    output: &Path,
+    name: &str,
     volume_bounds: &WorldBounds,
     dimension_bounds: DimensionBounds,
     guides: &GuideBlocks,
     spawn: [i32; 3],
 ) -> Result<()> {
-    let name = output
-        .file_name()
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "nii2mc world".to_string());
+    let name = name.to_string();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -390,6 +444,23 @@ fn write_world_metadata(
             ("SpawnY", Value::Int(spawn[1])),
             ("SpawnZ", Value::Int(spawn[2])),
             ("SpawnAngle", Value::Float(0.0)),
+            // Current Java versions store the world spawn in this compound;
+            // the legacy fields above remain for older readers.
+            (
+                "spawn",
+                compound([
+                    (
+                        "dimension",
+                        Value::String("minecraft:overworld".to_string()),
+                    ),
+                    (
+                        "pos",
+                        Value::IntArray(fastnbt::IntArray::new(spawn.to_vec())),
+                    ),
+                    ("yaw", Value::Float(0.0)),
+                    ("pitch", Value::Float(0.0)),
+                ]),
+            ),
             (
                 "Version",
                 compound([
@@ -744,6 +815,61 @@ pub fn export_nifti(world: &Path, output: &Path) -> Result<ConversionReport> {
         minecraft_version: manifest.minecraft_version,
         dimension_bounds: manifest.dimension_bounds,
         volume_bounds: manifest.volume_bounds,
+        transform: manifest.transform,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResampleReport {
+    pub output: PathBuf,
+    pub dimensions: [u32; 3],
+    pub voxel_count: u64,
+    pub nonzero_labels: usize,
+    pub transform: TransformRecord,
+}
+
+/// Write the derived grid that `to-world` would build with the same options.
+pub fn resample_nifti(
+    input: &Path,
+    output: &Path,
+    options: &TransformOptions,
+) -> Result<ResampleReport> {
+    if output.exists() {
+        return Err(AppError::usage(format!(
+            "output {} already exists; refusing to overwrite it",
+            output.display()
+        )));
+    }
+    let output_text = output.to_string_lossy();
+    if !(output_text.ends_with(".nii") || output_text.ends_with(".nii.gz")) {
+        return Err(AppError::usage("output path must end in .nii or .nii.gz"));
+    }
+    eprintln!("Reading and validating {}...", input.display());
+    let volume = crate::nifti::read_nifti(input)?;
+    eprintln!("Resampling and orienting the label grid...");
+    let (derived, record) = crate::resample::transform(volume, options)?;
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temporary = TempDir::new_in(parent)?;
+    let staging = temporary.path().join(
+        output
+            .file_name()
+            .ok_or_else(|| AppError::usage("output must name a NIfTI file"))?,
+    );
+    write_nifti(
+        &staging,
+        &derived.prefix,
+        &derived.metadata,
+        &derived.voxels,
+    )?;
+    fs::rename(&staging, output)?;
+    eprintln!("Created {}", output.display());
+    Ok(ResampleReport {
+        output: output.to_path_buf(),
+        dimensions: derived.metadata.dimensions,
+        voxel_count: derived.voxels.len() as u64,
+        nonzero_labels: derived.counts.keys().filter(|label| **label != 0).count(),
+        transform: record,
     })
 }
 
