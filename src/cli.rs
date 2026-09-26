@@ -64,6 +64,10 @@ enum Commands {
         /// or {"5": {"block": "minecraft:bone_block", "name": "skull"}}
         #[arg(long)]
         palette: Option<PathBuf>,
+
+        /// Namespace and folder of the custom-height dimension data pack [default: nii2mc]
+        #[arg(long)]
+        pack_id: Option<String>,
     },
 
     /// Write the cubic-block label grid that to-world would build, as NIfTI
@@ -187,7 +191,8 @@ fn execute(cli: Cli) -> std::result::Result<(), (AppError, bool)> {
             world_name,
             source_name,
             palette,
-        } => world_options(vertical_axis, &transform, world_name, source_name, palette)
+            pack_id,
+        } => world_options(vertical_axis, &transform, world_name, source_name, palette, pack_id)
             .and_then(|options| world::create_world_with(&input, &output, &options))
             .and_then(|report| {
                 let mut text = format!(
@@ -283,7 +288,21 @@ fn world_options(
     world_name: Option<String>,
     source_name: Option<String>,
     palette: Option<PathBuf>,
+    pack_id: Option<String>,
 ) -> Result<WorldOptions> {
+    if let Some(id) = pack_id.as_deref() {
+        let valid = !id.is_empty()
+            && id.len() <= 64
+            && id.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.')
+            })
+            && !matches!(id, "minecraft" | "vanilla");
+        if !valid {
+            return Err(AppError::usage(
+                "--pack-id must use a-z, 0-9, '_', '-' or '.' and must not be minecraft or vanilla",
+            ));
+        }
+    }
     let palette = match palette {
         None => Default::default(),
         Some(path) => {
@@ -311,6 +330,7 @@ fn world_options(
         world_name,
         source_name,
         palette,
+        pack_id,
     })
 }
 

@@ -694,3 +694,59 @@ fn read_gzip_nbt(path: &Path) -> HashMap<String, Value> {
     decoder.read_to_end(&mut bytes).unwrap();
     fastnbt::from_bytes(&bytes).unwrap()
 }
+
+#[test]
+fn pack_id_renames_the_dimension_data_pack() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("labels.nii");
+    let labels = vec![1u8; 64];
+    write_fixture(
+        &source,
+        &Fixture {
+            dimensions: [4, 4, 4],
+            spacing: [1.0; 3],
+            sform: None,
+            xml: "",
+            ecode: 0,
+        },
+        &labels,
+    );
+    let world = temporary.path().join("world");
+    create_world_with(
+        &source,
+        &world,
+        &WorldOptions {
+            pack_id: Some("modelmyscan".to_string()),
+            ..WorldOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        world
+            .join("datapacks/modelmyscan/data/modelmyscan/dimension_type/overworld.json")
+            .is_file()
+    );
+    assert!(!world.join("datapacks/nii2mc").exists());
+    let mut level = Vec::new();
+    GzDecoder::new(fs::File::open(world.join("level.dat")).unwrap())
+        .read_to_end(&mut level)
+        .unwrap();
+    let text = String::from_utf8_lossy(&level);
+    assert!(text.contains("file/modelmyscan"));
+    assert!(!text.contains("nii2mc"));
+    let mut settings = Vec::new();
+    GzDecoder::new(fs::File::open(world.join("data/minecraft/world_gen_settings.dat")).unwrap())
+        .read_to_end(&mut settings)
+        .unwrap();
+    assert!(String::from_utf8_lossy(&settings).contains("modelmyscan:overworld"));
+    let pack = fs::read_to_string(world.join("datapacks/modelmyscan/pack.mcmeta")).unwrap();
+    assert!(!pack.contains("nii2mc"));
+
+    Command::cargo_bin("nii2mc")
+        .unwrap()
+        .args(["to-world", source.to_str().unwrap(), "--output"])
+        .arg(temporary.path().join("bad"))
+        .args(["--pack-id", "Bad Name"])
+        .assert()
+        .failure();
+}

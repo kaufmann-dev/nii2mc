@@ -29,8 +29,8 @@ const VANILLA_HEIGHT: u32 = (VANILLA_MAX_Y - VANILLA_MIN_Y + 1) as u32;
 const MIN_DIMENSION_Y: i32 = -2032;
 pub const MAX_VERTICAL_VOXELS: u32 = 4064;
 const SECTION_HEIGHT: u32 = 16;
-const DATA_PACK_ID: &str = "file/nii2mc";
-const DIMENSION_TYPE_ID: &str = "nii2mc:overworld";
+/// Default namespace of the custom-height dimension data pack.
+pub const DEFAULT_PACK_ID: &str = "nii2mc";
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum VerticalAxis {
@@ -96,6 +96,9 @@ pub struct WorldOptions {
     /// File name recorded in the manifest instead of the real input name.
     pub source_name: Option<String>,
     pub palette: BTreeMap<u32, PaletteOverride>,
+    /// Namespace (and folder) of the custom-height dimension data pack
+    /// (default `nii2mc`), e.g. to brand worlds made for others.
+    pub pack_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -266,9 +269,11 @@ pub fn create_world_with(
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| "nii2mc world".to_string())
     });
+    let pack_id = options.pack_id.as_deref().unwrap_or(DEFAULT_PACK_ID);
     write_world_metadata(
         &staging,
         &world_name,
+        pack_id,
         &placement.bounds,
         placement.dimension_bounds,
         &guides,
@@ -419,6 +424,7 @@ fn required_chunk_set(bounds: ChunkBounds) -> BTreeSet<(i32, i32)> {
 fn write_world_metadata(
     world: &Path,
     name: &str,
+    pack_id: &str,
     volume_bounds: &WorldBounds,
     dimension_bounds: DimensionBounds,
     guides: &GuideBlocks,
@@ -477,7 +483,7 @@ fn write_world_metadata(
                         "Enabled",
                         Value::List(vec![
                             Value::String("vanilla".to_string()),
-                            Value::String(DATA_PACK_ID.to_string()),
+                            Value::String(format!("file/{pack_id}")),
                         ]),
                     ),
                     ("Disabled", Value::List(Vec::new())),
@@ -499,7 +505,7 @@ fn write_world_metadata(
         ]),
     )]);
     anvil::write_gzip_nbt(&world.join("level.dat"), &level_data)?;
-    write_dimension_data_pack(world, dimension_bounds)?;
+    write_dimension_data_pack(world, dimension_bounds, pack_id)?;
 
     let data_root = |data| {
         HashMap::from([
@@ -559,7 +565,7 @@ fn write_world_metadata(
             Value::Compound(HashMap::from([
                 (
                     "minecraft:overworld".to_string(),
-                    dimension_generator(DIMENSION_TYPE_ID, "minecraft:the_void"),
+                    dimension_generator(&format!("{pack_id}:overworld"), "minecraft:the_void"),
                 ),
                 (
                     "minecraft:the_nether".to_string(),
@@ -609,10 +615,15 @@ fn write_world_metadata(
     Ok(())
 }
 
-fn write_dimension_data_pack(world: &Path, bounds: DimensionBounds) -> Result<()> {
+fn write_dimension_data_pack(world: &Path, bounds: DimensionBounds, pack_id: &str) -> Result<()> {
+    let description = if pack_id == DEFAULT_PACK_ID {
+        "nii2mc custom-height Overworld".to_string()
+    } else {
+        "Custom-height Overworld".to_string()
+    };
     let pack = json!({
         "pack": {
-            "description": "nii2mc custom-height Overworld",
+            "description": description,
             "min_format": [107, 1],
             "max_format": 107
         }
@@ -672,8 +683,8 @@ fn write_dimension_data_pack(world: &Path, bounds: DimensionBounds) -> Result<()
         },
         "timelines": "#minecraft:in_overworld"
     });
-    let pack_root = world.join("datapacks/nii2mc");
-    let dimension_directory = pack_root.join("data/nii2mc/dimension_type");
+    let pack_root = world.join("datapacks").join(pack_id);
+    let dimension_directory = pack_root.join("data").join(pack_id).join("dimension_type");
     fs::create_dir_all(&dimension_directory)?;
     let pack_bytes = serde_json::to_vec_pretty(&pack)
         .map_err(|error| AppError::io(format!("cannot encode dimension data pack: {error}")))?;
