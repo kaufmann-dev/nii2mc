@@ -53,6 +53,7 @@ nii2mc to-world labels.nii.gz --output ./skull-world \
 
 - `--world-name` sets the name shown in Minecraft's world list (default: the output folder name).
 - `--source-name` records this file name in the world instead of the real input name, for example to keep a patient name out of the saved world.
+- `--pack-id` names the custom-height dimension data pack and its namespace (default `nii2mc`), for example to brand worlds you make for others. It uses `a-z`, `0-9`, `_`, `-` and `.`.
 - `--palette` chooses blocks and legend names per label. The file is a JSON object such as `{"5": "bone_block", "7": {"block": "minecraft:red_wool", "name": "heart"}}`. Blocks must come from the supported list shown by `nii2mc blocks`, and each block can be used once; labels that are not listed keep the automatic choice.
 
 Place the generated directory in the Minecraft Java saves directory, which is usually `$HOME/.minecraft/saves` on Linux, and open it with Java Edition 26.2. Keep the sea-lantern wireframe: it marks the exact region that will be exported.
