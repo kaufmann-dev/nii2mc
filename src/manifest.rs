@@ -1,4 +1,5 @@
 use crate::error::{AppError, Result};
+use crate::resample::TransformRecord;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -88,6 +89,11 @@ pub struct Manifest {
     pub volume_bounds: WorldBounds,
     pub required_chunks: ChunkBounds,
     pub palette: Vec<PaletteEntry>,
+    /// Present only when `--block-mm`, `--orient anatomical`, or `--crop`
+    /// derived the world grid from the source; `nifti` and the saved prefix
+    /// then describe that derived grid, which `to-nifti` exports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<TransformRecord>,
 }
 
 impl Manifest {

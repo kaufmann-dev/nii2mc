@@ -1,7 +1,9 @@
 use crate::error::{AppError, Result};
 use crate::manifest::{MINECRAFT_DATA_VERSION, MINECRAFT_VERSION};
 use crate::nifti::read_nifti;
-use crate::world::{self, MAX_VERTICAL_VOXELS, VerticalAxis};
+use crate::palette::{block_color, block_palette, parse_palette_overrides};
+use crate::resample::{BlockSize, Orientation, TransformOptions};
+use crate::world::{self, MAX_VERTICAL_VOXELS, VerticalAxis, WorldOptions};
 use clap::{CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -12,7 +14,7 @@ use std::path::PathBuf;
     name = "nii2mc",
     version,
     about = "Round-trip discrete NIfTI label maps through editable Minecraft Java worlds",
-    long_about = "Convert 3D integer .nii or .nii.gz label maps into Minecraft Java 26.2 worlds with one voxel per block, then export edited worlds back to NIfTI without changing the original header, extensions, affine, or voxel dimensions."
+    long_about = "Convert 3D integer .nii or .nii.gz label maps into Minecraft Java 26.2 worlds with one voxel per block, then export edited worlds back to NIfTI without changing the original header, extensions, affine, or voxel dimensions. Optional --block-mm and --orient anatomical build cubic blocks from anisotropic scans and stand anatomy upright without mirroring."
 )]
 struct Cli {
     /// Emit a stable JSON envelope to stdout; progress remains on stderr
@@ -43,10 +45,42 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
 
-        /// NIfTI axis mapped to Minecraft's vertical Y axis
-        #[arg(long, value_enum, default_value_t = VerticalAxis::Z)]
-        vertical_axis: VerticalAxis,
+        /// NIfTI axis mapped to Minecraft's vertical Y axis [default: z]
+        #[arg(long, value_enum)]
+        vertical_axis: Option<VerticalAxis>,
+
+        #[command(flatten)]
+        transform: TransformArgs,
+
+        /// World name shown in Minecraft's world list [default: output folder name]
+        #[arg(long)]
+        world_name: Option<String>,
+
+        /// File name recorded in the world instead of the input's name
+        #[arg(long)]
+        source_name: Option<String>,
+
+        /// JSON object choosing blocks/names per label, e.g. {"5": "bone_block"}
+        /// or {"5": {"block": "minecraft:bone_block", "name": "skull"}}
+        #[arg(long)]
+        palette: Option<PathBuf>,
     },
+
+    /// Write the cubic-block label grid that to-world would build, as NIfTI
+    Resample {
+        /// Input 3D integer .nii or .nii.gz label map
+        input: PathBuf,
+
+        /// New .nii or .nii.gz file; existing paths are never overwritten
+        #[arg(long)]
+        output: PathBuf,
+
+        #[command(flatten)]
+        transform: TransformArgs,
+    },
+
+    /// List the supported label blocks with approximate colors
+    Blocks,
 
     /// Show label IDs, block IDs, embedded names, counts, and legend positions
     Palette {
@@ -69,6 +103,37 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
     },
+}
+
+#[derive(Debug, clap::Args)]
+struct TransformArgs {
+    /// Resample to cubic blocks of this size in mm, or 'auto' (tallest axis
+    /// at most 320 blocks, at most 64 million blocks, never finer than the scan)
+    #[arg(long, value_name = "MM|auto")]
+    block_mm: Option<BlockSize>,
+
+    /// Keep voxel axes as stored, or stand anatomy upright without mirroring
+    #[arg(long = "orient", value_enum, default_value_t = Orientation::Voxel)]
+    orientation: Orientation,
+
+    /// Fraction of a block that labels must cover for it to be filled
+    #[arg(long, default_value_t = 0.5, requires = "block_mm")]
+    fill_threshold: f64,
+
+    /// Crop to the labelled region (plus a small margin) before resampling
+    #[arg(long, requires = "block_mm")]
+    crop: bool,
+}
+
+impl TransformArgs {
+    fn options(&self) -> TransformOptions {
+        TransformOptions {
+            block: self.block_mm,
+            orientation: self.orientation,
+            fill_threshold: self.fill_threshold,
+            crop: self.crop,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -118,18 +183,63 @@ fn execute(cli: Cli) -> std::result::Result<(), (AppError, bool)> {
             input,
             output,
             vertical_axis,
-        } => world::create_world(&input, &output, vertical_axis).and_then(|report| {
+            transform,
+            world_name,
+            source_name,
+            palette,
+        } => world_options(vertical_axis, &transform, world_name, source_name, palette)
+            .and_then(|options| world::create_world_with(&input, &output, &options))
+            .and_then(|report| {
+                let mut text = format!(
+                    "Created Minecraft Java {} world {}\n{} voxels, {} nonzero labels; volume bounds {:?} to {:?}",
+                    report.minecraft_version,
+                    report.output.display(),
+                    report.voxel_count,
+                    report.nonzero_labels,
+                    report.volume_bounds.min,
+                    report.volume_bounds.max
+                );
+                if let Some(record) = &report.transform {
+                    text.push_str(&transform_text(record));
+                }
+                emit_serializable("to-world", &report, text, json_mode)
+            }),
+        Commands::Resample {
+            input,
+            output,
+            transform,
+        } => world::resample_nifti(&input, &output, &transform.options()).and_then(|report| {
             let text = format!(
-                "Created Minecraft Java {} world {}\n{} voxels, {} nonzero labels; volume bounds {:?} to {:?}",
-                report.minecraft_version,
+                "Created {} with dimensions {:?}{}",
                 report.output.display(),
-                report.voxel_count,
-                report.nonzero_labels,
-                report.volume_bounds.min,
-                report.volume_bounds.max
+                report.dimensions,
+                transform_text(&report.transform)
             );
-            emit_serializable("to-world", &report, text, json_mode)
+            emit_serializable("resample", &report, text, json_mode)
         }),
+        Commands::Blocks => {
+            let blocks: Vec<Value> = block_palette()
+                .into_iter()
+                .map(|block| {
+                    let rgb = block_color(&block).unwrap_or([128, 128, 128]);
+                    json!({
+                        "block": block,
+                        "rgb": rgb,
+                        "hex": format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
+                    })
+                })
+                .collect();
+            let mut text = format!("{} supported label blocks", blocks.len());
+            for entry in &blocks {
+                text.push_str(&format!(
+                    "\n{}\t{}",
+                    entry["block"].as_str().unwrap_or_default(),
+                    entry["hex"].as_str().unwrap_or_default()
+                ));
+            }
+            emit_success("blocks", Value::Array(blocks), text, json_mode);
+            Ok(())
+        }
         Commands::Palette { world: path } => world::palette(&path).and_then(|palette| {
             let mut text = format!("{} label mappings in {}", palette.len(), path.display());
             for entry in &palette {
@@ -165,6 +275,60 @@ fn execute(cli: Cli) -> std::result::Result<(), (AppError, bool)> {
         }
     };
     result.map_err(|error| (error, json_mode))
+}
+
+fn world_options(
+    vertical_axis: Option<VerticalAxis>,
+    transform: &TransformArgs,
+    world_name: Option<String>,
+    source_name: Option<String>,
+    palette: Option<PathBuf>,
+) -> Result<WorldOptions> {
+    let palette = match palette {
+        None => Default::default(),
+        Some(path) => {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                AppError::usage(format!("cannot read palette {}: {error}", path.display()))
+            })?;
+            parse_palette_overrides(&bytes)?
+        }
+    };
+    if world_name
+        .as_deref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err(AppError::usage("--world-name must not be empty"));
+    }
+    if source_name
+        .as_deref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err(AppError::usage("--source-name must not be empty"));
+    }
+    Ok(WorldOptions {
+        vertical_axis,
+        transform: transform.options(),
+        world_name,
+        source_name,
+        palette,
+    })
+}
+
+fn transform_text(record: &crate::resample::TransformRecord) -> String {
+    match record.block_mm {
+        Some(block) => format!(
+            "\nResampled {:?} voxels ({:?} mm) to {:?} blocks of {} mm; orientation {}",
+            record.source_dimensions,
+            record.source_spacing,
+            record.dimensions,
+            block,
+            record.orientation
+        ),
+        None => format!(
+            "\nReoriented {:?} voxels to {:?}; orientation {}",
+            record.source_dimensions, record.dimensions, record.orientation
+        ),
+    }
 }
 
 fn doctor() -> Result<Value> {
